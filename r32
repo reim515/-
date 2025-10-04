@@ -1,0 +1,488 @@
+"use client";
+import React, { useEffect, useRef, useState } from "react";
+
+/**
+ * Drop the Number (5x6) — 改善・安定化 完全版 + 一時停止
+ * 変更点:
+ * - P キー / ボタンで一時停止/再開
+ * - ポーズ中は game loop 停止、入力無効（N, P は受付）
+ * - 盤面に半透明オーバーレイで「Paused」表示
+ */
+
+const COLS = 5;
+const ROWS = 6;
+
+const INITIAL_TICK_MS = 1000;
+const MIN_TICK_MS = 300;
+
+const COIN_REWARDS = {
+  128: 5,
+  256: 10,
+  512: 20,
+  1024: 35,
+  2048: 50,
+  4096: 80,
+  8192: 120,
+};
+
+const GIMMICK_COST = 100; // 100コインでギミック+1
+
+const LS_KEYS = {
+  BEST: "dtn_best_5x6",
+  COINS: "dtn_coins_5x6",
+  REWARD_FLAGS: "dtn_rewards_5x6",
+};
+
+function randChoice(arr: any[]) { return arr[Math.floor(Math.random() * arr.length)]; }
+function clone<T>(x: T): T { return JSON.parse(JSON.stringify(x)); }
+
+function tileClass(v: number) {
+  const base = "flex items-center justify-center font-bold text-white rounded-xl shadow-md select-none";
+  const size = "w-14 h-14 text-lg";
+  const styles: Record<number, string> = {
+    2: "bg-gradient-to-br from-slate-500 to-slate-400",
+    4: "bg-gradient-to-br from-purple-600 to-purple-500",
+    8: "bg-gradient-to-br from-indigo-600 to-indigo-500",
+    16: "bg-gradient-to-br from-blue-600 to-blue-500",
+    32: "bg-gradient-to-br from-teal-600 to-teal-500",
+    64: "bg-gradient-to-br from-emerald-600 to-emerald-500",
+    128: "bg-gradient-to-br from-lime-600 to-lime-500",
+    256: "bg-gradient-to-br from-amber-600 to-amber-500",
+    512: "bg-gradient-to-br from-orange-600 to-orange-500",
+    1024: "bg-gradient-to-br from-rose-500 to-pink-500",
+    2048: "bg-gradient-to-br from-yellow-400 to-yellow-500 text-black ring-2 ring-yellow-300",
+    4096: "bg-gradient-to-br from-yellow-300 via-yellow-500 to-yellow-300 text-black ring-2 ring-yellow-200",
+    8192: "bg-gradient-to-br from-gray-200 to-gray-400 text-black ring-2 ring-gray-300",
+  };
+  if (v >= 16384) {
+    return `${base} ${size} bg-gradient-to-br from-yellow-200 via-yellow-400 to-yellow-200 text-black ring-2 ring-yellow-300`;
+  }
+  return `${base} ${size} ${styles[v] || "bg-gray-700"}`;
+}
+
+function emptyBoard() { return Array.from({ length: ROWS }, () => Array(COLS).fill(0)); }
+function inside(r: number, c: number) { return r >= 0 && r < ROWS && c >= 0 && c < COLS; }
+
+function applyGravity(b: number[][]) {
+  const nb = clone(b);
+  for (let c = 0; c < COLS; c++) {
+    const stack: number[] = [];
+    for (let r = ROWS - 1; r >= 0; r--) if (nb[r][c] !== 0) stack.push(nb[r][c]);
+    for (let r = ROWS - 1; r >= 0; r--) nb[r][c] = stack[ROWS - 1 - r] || 0; // bottom-fill
+  }
+  return nb;
+}
+
+function getComponent(b: number[][], sr: number, sc: number, val: number, seen: Set<string>) {
+  const q = [{ r: sr, c: sc }];
+  const comp: { r: number; c: number }[] = [];
+  const key = (r: number, c: number) => `${r},${c}`;
+  seen.add(key(sr, sc));
+  const dirs = [{ dr: 1, dc: 0 }, { dr: -1, dc: 0 }, { dr: 0, dc: 1 }, { dr: 0, dc: -1 }];
+  while (q.length) {
+    const cur = q.shift()!;
+    comp.push(cur);
+    for (const d of dirs) {
+      const r2 = cur.r + d.dr, c2 = cur.c + d.dc, k2 = key(r2, c2);
+      if (!inside(r2, c2) || seen.has(k2)) continue;
+      if (b[r2][c2] === val) { seen.add(k2); q.push({ r: r2, c: c2 }); }
+    }
+  }
+  return comp;
+}
+
+function resolveAllMerges(b: number[][], preferredAnchor: { r: number; c: number } | null) {
+  let board = clone(b);
+  let totalGained = 0;
+  let changed = false;
+  const isSameCell = (p: any, q: any) => p && q && p.r === q.r && p.c === q.c;
+
+  while (true) {
+    let passChanged = false;
+    const seen = new Set<string>();
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+      const v = board[r][c]; if (v === 0) continue;
+      const k = `${r},${c}`; if (seen.has(k)) continue;
+      const comp = getComponent(board, r, c, v, seen);
+      if (comp.length >= 2) {
+        let anchor = comp[0];
+        if (preferredAnchor && comp.some((p) => isSameCell(p, preferredAnchor))) {
+          anchor = preferredAnchor;
+        } else {
+          for (const p of comp) if (p.r > anchor.r) anchor = p; // 最下段優先
+        }
+        const newVal = v * (comp.length >= 3 ? 4 : 2);
+        for (const p of comp) board[p.r][p.c] = 0;
+        board[anchor.r][anchor.c] = newVal;
+        totalGained += newVal;
+        passChanged = true;
+      }
+    }
+    if (!passChanged) break;
+    board = applyGravity(board);
+    changed = true;
+  }
+  return { board, gained: totalGained, changed };
+}
+
+function nextSpawnValue(maxTile: number) {
+  if (maxTile < 1024) return randChoice([2, 4, 8, 16, 32]);
+  if (maxTile === 1024) return randChoice([2, 4, 8, 16, 32, 64]);
+  return randChoice([2, 4, 8, 16, 32, 64, 128]);
+}
+
+type Falling = { value: number; row: number; col: number } | null;
+
+export default function DropTheNumber() {
+  const [board, setBoard] = useState<number[][]>(emptyBoard);
+  const [falling, setFalling] = useState<Falling>(null);
+  const [tickMs, setTickMs] = useState(INITIAL_TICK_MS);
+  const [score, setScore] = useState(0);
+
+  // 追加: 一時停止
+  const [isPaused, setIsPaused] = useState(false);
+
+  // SSR安全 永続
+  const [best, setBest] = useState(0);
+  const [coins, setCoins] = useState(0);
+  const [rewardFlags, setRewardFlags] = useState<Record<string, boolean>>({});
+  const [hydrated, setHydrated] = useState(false);
+
+  const [isOver, setIsOver] = useState(false);
+  const [maxTile, setMaxTile] = useState(0);
+  const [pendingGimmicks, setPendingGimmicks] = useState(0);
+  const [gimmickTarget, setGimmickTarget] = useState(2);
+
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const lastSpawnColRef = useRef<number | null>(null);
+
+  // Hydrate
+  useEffect(() => {
+    try {
+      const b = Number(localStorage.getItem(LS_KEYS.BEST) || 0);
+      const c = Number(localStorage.getItem(LS_KEYS.COINS) || 0);
+      const rf = JSON.parse(localStorage.getItem(LS_KEYS.REWARD_FLAGS) || "{}") || {};
+      setBest(b); setCoins(c); setRewardFlags(rf);
+    } catch {}
+    setHydrated(true);
+  }, []);
+  useEffect(() => { if (hydrated) localStorage.setItem(LS_KEYS.BEST, String(best)); }, [best, hydrated]);
+  useEffect(() => { if (hydrated) localStorage.setItem(LS_KEYS.COINS, String(coins)); }, [coins, hydrated]);
+  useEffect(() => { if (hydrated) localStorage.setItem(LS_KEYS.REWARD_FLAGS, JSON.stringify(rewardFlags)); }, [rewardFlags, hydrated]);
+
+  // spawn
+  const spawn = (b: number[][], mt: number, preferredCol: number | null = null): Falling => {
+    const val = nextSpawnValue(mt);
+    if (preferredCol !== null) {
+      if (b[0][preferredCol] === 0) return { value: val, row: -1, col: preferredCol };
+      return null; // 上段埋まり → 終了
+    }
+    const candidates: number[] = [];
+    for (let c = 0; c < COLS; c++) if (b[0][c] === 0) candidates.push(c);
+    if (!candidates.length) return null;
+    return { value: val, row: -1, col: randChoice(candidates) };
+  };
+
+  const reset = () => {
+    setBoard(emptyBoard());
+    setFalling(null);
+    setTickMs(INITIAL_TICK_MS);
+    setScore(0);
+    setIsOver(false);
+    setIsPaused(false); // 再開状態で開始
+    setMaxTile(0);
+    lastSpawnColRef.current = null;
+  };
+
+  const maybeGrantCoins = (newMax: number) => {
+    let granted = 0;
+    const newFlags = { ...rewardFlags };
+    for (const [k, v] of Object.entries(COIN_REWARDS)) {
+      const th = Number(k);
+      if (newMax >= th && !newFlags[k]) { granted += v; newFlags[k] = true; }
+    }
+    if (granted) { setCoins((c) => c + granted); setRewardFlags(newFlags); }
+  };
+
+  const computeLandingRow = (b: number[][], col: number) => {
+    let row = -1;
+    while (row + 1 < ROWS && (row + 1 < 0 || b[row + 1][col] === 0)) row++;
+    return row;
+  };
+
+  const canMoveDown = (f: NonNullable<Falling>, b: number[][]) => {
+    const nextR = f.row + 1;
+    if (nextR >= ROWS) return false;
+    if (nextR >= 0 && b[nextR][f.col] !== 0) return false;
+    return true;
+  };
+
+  const settleAndMerge = (value: number, landingRow: number, col: number, b: number[][]) => {
+    let nb = clone(b);
+    const lr = landingRow;
+    if (!inside(lr, col) || nb[lr][col] !== 0) return { board: nb, gained: 0, landedValue: 0 };
+    nb[lr][col] = value;
+    const res = resolveAllMerges(nb, { r: lr, c: col });
+    return { board: res.board, gained: res.gained, landedValue: value };
+  };
+
+  const spawnSameColOrEnd = (newBoard: number[][], newMax: number, landedCol: number) => {
+    const nf = spawn(newBoard, Math.max(maxTile, newMax), landedCol);
+    if (!nf) { setIsOver(true); return null; }
+    lastSpawnColRef.current = nf.col;
+    return nf;
+  };
+
+  const hardDropAndSettle = () => {
+    if (isPaused) return; // ポーズ中は無効
+    setFalling((prev) => {
+      if (!prev) return prev;
+      let rr = prev.row;
+      while (rr + 1 < ROWS && (rr + 1 < 0 || board[rr + 1][prev.col] === 0)) rr++;
+      if (rr < 0) { setIsOver(true); return null; }
+      const res = settleAndMerge(prev.value, rr, prev.col, board);
+      const newBoard = res.board;
+      setBoard(newBoard);
+      setScore((s) => s + res.gained);
+      const newMax = Math.max(maxTile, ...newBoard.flat());
+      if (newMax > maxTile) { setMaxTile(newMax); maybeGrantCoins(newMax); setTickMs((t) => Math.max(MIN_TICK_MS, t - 10)); }
+      const nf = spawnSameColOrEnd(newBoard, newMax, prev.col);
+      if (!nf) return null;
+      return nf;
+    });
+  };
+
+  // game loop （ポーズ中 or ゲームオーバー中は動かさない）
+  useEffect(() => {
+    if (isOver || isPaused) return;
+    const id = setInterval(() => {
+      setFalling((prev) => {
+        if (isOver || isPaused) return prev;
+        if (!prev) {
+          const nf = spawn(board, maxTile);
+          if (!nf) { setIsOver(true); return null; }
+          lastSpawnColRef.current = nf.col;
+          return nf;
+        }
+        if (canMoveDown(prev, board)) return { ...prev, row: prev.row + 1 };
+        if (prev.row < 0) { setIsOver(true); return null; }
+        const landR = computeLandingRow(board, prev.col);
+        if (landR < 0) { setIsOver(true); return null; }
+        const res = settleAndMerge(prev.value, landR, prev.col, board);
+        const newBoard = res.board;
+        setBoard(newBoard);
+        setScore((s) => s + res.gained);
+        const newMax = Math.max(maxTile, ...newBoard.flat());
+        if (newMax > maxTile) { setMaxTile(newMax); maybeGrantCoins(newMax); setTickMs((t)=>Math.max(MIN_TICK_MS, t-10)); }
+        const nf = spawnSameColOrEnd(newBoard, newMax, prev.col);
+        if (!nf) return null;
+        return nf;
+      });
+    }, tickMs);
+    return () => clearInterval(id);
+  }, [board, maxTile, tickMs, isOver, isPaused]);
+
+  // best
+  useEffect(() => { if (score > best) setBest(score); }, [score, best]);
+
+  // input
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const key = e.key;
+      if (key.toLowerCase() === "p") { setIsPaused((p) => !p); return; }
+      if (key.toLowerCase() === "n") { reset(); return; }
+      if (isPaused) return; // ポーズ中は他の入力無効
+      if (!falling) return;
+
+      if (key === "ArrowLeft") {
+        const nc = Math.max(0, falling.col - 1);
+        if (falling.row >= 0 && board[falling.row][nc] !== 0) return;
+        setFalling({ ...falling, col: nc });
+      } else if (key === "ArrowRight") {
+        const nc = Math.min(COLS - 1, falling.col + 1);
+        if (falling.row >= 0 && board[falling.row][nc] !== 0) return;
+        setFalling({ ...falling, col: nc });
+      } else if (key === "ArrowDown") {
+        setFalling((f) => (f && canMoveDown(f, board) ? { ...f, row: f.row + 1 } : f));
+      } else if (key === " ") {
+        e.preventDefault();
+        hardDropAndSettle();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [falling, board, isOver, maxTile, isPaused]);
+
+  // gimmick
+  const triggerGimmick = () => {
+    if (isPaused) return; // ポーズ中は発動不可
+    if (pendingGimmicks <= 0) return;
+    setBoard((b) => {
+      const nb = clone(b);
+      let removed = 0;
+      for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+        if (nb[r][c] === gimmickTarget) { nb[r][c] = 0; removed++; }
+      }
+      const after = applyGravity(nb);
+      if (removed > 0) setScore((s) => s + gimmickTarget * removed);
+      return after;
+    });
+    setPendingGimmicks((x) => Math.max(0, x - 1));
+  };
+
+  const buyGimmick = () => {
+    if (isPaused) return;
+    if (coins < GIMMICK_COST) return;
+    setCoins((c) => c - GIMMICK_COST);
+    setPendingGimmicks((x) => x + 1);
+  };
+
+  const canBuy = coins >= GIMMICK_COST;
+  const tryMoveH = (dir: number) => setFalling(f => {
+    if (isPaused) return f;
+    if (!f) return f;
+    const nc = Math.min(COLS - 1, Math.max(0, f.col + dir));
+    if (f.row >= 0 && board[f.row][nc] !== 0) return f;
+    return { ...f, col: nc };
+  });
+
+  const renderCell = (r: number, c: number) => {
+    let v = board[r][c];
+    if (falling && falling.row === r && falling.col === c) v = falling.value;
+    if (v === 0) return <div key={`${r}-${c}`} className="w-14 h-14 rounded-xl bg-neutral-800/60" />;
+    return <div key={`${r}-${c}`} className={tileClass(v)}>{v}</div>;
+  };
+
+  return (
+    <div ref={containerRef} className="min-h-screen w-full bg-neutral-900 text-neutral-100 flex flex-col items-center py-6">
+      <div className="max-w-md w-full px-4">
+        <h1 className="text-2xl font-bold mb-2">Drop the Number — 5×6</h1>
+        <div className="text-sm text-neutral-300 mb-3">
+          ←→ 移動／↓ 落下／Space ハードドロップ／N 新規／<span className="font-semibold">P 一時停止/再開</span>
+        </div>
+
+        <div className="grid grid-cols-3 gap-3 mb-3">
+          <div className="p-3 bg-neutral-800 rounded-xl">
+            <div className="text-xs text-neutral-400">SCORE</div>
+            <div className="text-2xl font-bold">{score.toLocaleString()}</div>
+          </div>
+          <div className="p-3 bg-neutral-800 rounded-xl">
+            <div className="text-xs text-neutral-400">BEST</div>
+            <div className="text-2xl font-bold">{best.toLocaleString()}</div>
+          </div>
+          <div className="p-3 bg-neutral-800 rounded-xl">
+            <div className="text-xs text-neutral-400">MAX TILE</div>
+            <div className="text-2xl font-bold">{maxTile || 0}</div>
+          </div>
+        </div>
+
+        <div className="p-3 bg-neutral-800 rounded-2xl mb-3">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setIsPaused(p => !p)}
+                className={`px-3 py-2 rounded-xl text-sm font-semibold ${isPaused ? "bg-emerald-600 hover:bg-emerald-500" : "bg-neutral-700 hover:bg-neutral-600"}`}
+                title="P キーでも切り替えできます"
+              >
+                {isPaused ? "再開" : "一時停止"}
+              </button>
+              <button onClick={reset} className="px-3 py-2 rounded-xl text-sm font-semibold bg-rose-600 hover:bg-rose-500">
+                新規
+              </button>
+            </div>
+            <div className="flex items-center gap-3">
+              <div>
+                <div className="text-xs text-neutral-400">COINS</div>
+                <div className="text-2xl font-bold">{coins}</div>
+              </div>
+              <button
+                onClick={buyGimmick}
+                disabled={!canBuy || isPaused}
+                className={`px-3 py-2 rounded-xl text-sm font-semibold ${canBuy && !isPaused ? "bg-amber-500 hover:bg-amber-400 text-black" : "bg-neutral-700 text-neutral-400"}`}
+                title={`コスト: ${GIMMICK_COST} コイン`}
+              >
+                ギミック購入 (+1)
+              </button>
+              <div className="px-3 py-2 rounded-xl bg-neutral-700 text-sm">所持ギミック: {pendingGimmicks}</div>
+            </div>
+          </div>
+
+          <div className="mt-3 flex items-center gap-2">
+            <label className="text-sm text-neutral-300">消去ターゲット:</label>
+            <input
+              type="number" min={2} step={2} value={gimmickTarget}
+              onChange={(e) => {
+                const n = Math.max(2, Number(e.target.value) || 2);
+                const p = Math.pow(2, Math.round(Math.log2(n)));
+                setGimmickTarget(p);
+              }}
+              disabled={isPaused}
+              className="w-24 px-2 py-1 rounded-lg bg-neutral-900 border border-neutral-700 disabled:opacity-60"
+            />
+            <button
+              onClick={triggerGimmick}
+              disabled={pendingGimmicks <= 0 || isPaused}
+              className={`px-3 py-2 rounded-xl text-sm font-semibold ${pendingGimmicks > 0 && !isPaused ? "bg-indigo-500 hover:bg-indigo-400" : "bg-neutral-700 text-neutral-400"}`}
+            >
+              発動：指定数を全消去
+            </button>
+          </div>
+        </div>
+
+        <div className="mx-auto w-full flex justify-center">
+          <div className="relative p-3 rounded-2xl bg-neutral-800/60 ring-1 ring-neutral-700">
+            <div className="grid grid-cols-5 gap-2">
+              {Array.from({ length: ROWS }).map((_, r) => (
+                <React.Fragment key={r}>
+                  {Array.from({ length: COLS }).map((_, c) => renderCell(r, c))}
+                </React.Fragment>
+              ))}
+            </div>
+
+            {/* ポーズ中オーバーレイ */}
+            {isPaused && !isOver && (
+              <div className="absolute inset-0 bg-black/60 rounded-2xl flex items-center justify-center">
+                <div className="px-6 py-3 rounded-xl bg-neutral-900/80 ring-1 ring-neutral-700">
+                  <div className="text-xl font-bold tracking-wide">Paused</div>
+                  <div className="text-xs text-neutral-300 mt-1">P で再開 / ボタンでもOK</div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* mobile controls */}
+        <div className="mt-4 grid grid-cols-3 gap-2">
+          <button onClick={() => tryMoveH(-1)} disabled={isPaused} className="py-3 rounded-xl bg-neutral-800 hover:bg-neutral-700 disabled:opacity-50">←</button>
+          <button
+            onClick={() => setFalling((f) => (isPaused ? f : (f && canMoveDown(f, board) ? { ...f, row: f.row + 1 } : f)))}
+            disabled={isPaused}
+            className="py-3 rounded-xl bg-neutral-800 hover:bg-neutral-700 disabled:opacity-50"
+          >
+            ↓
+          </button>
+          <button onClick={() => tryMoveH(+1)} disabled={isPaused} className="py-3 rounded-xl bg-neutral-800 hover:bg-neutral-700 disabled:opacity-50">→</button>
+          <button onClick={hardDropAndSettle} disabled={isPaused} className="py-3 rounded-xl bg-indigo-600 hover:bg-indigo-500 col-span-2 disabled:opacity-50">ハードドロップ（即確定）</button>
+          <button onClick={reset} className="py-3 rounded-xl bg-rose-600 hover:bg-rose-500">新規</button>
+        </div>
+
+        {isOver && (
+          <div className="mt-4 p-4 rounded-xl bg-rose-900/40 ring-1 ring-rose-700">
+            <div className="text-lg font-bold">Game Over</div>
+            <div className="text-sm text-neutral-300">N で新規開始できます。</div>
+          </div>
+        )}
+
+        <div className="mt-6 text-xs text-neutral-400 leading-relaxed">
+          <p className="mb-2">仕様メモ：</p>
+          <ul className="list-disc pl-5 space-y-1">
+            <li>着地時に上下左右の同値のみ判定。1個なら×2、2個以上なら×4（+2段階）。異なる数では消えません。</li>
+            <li>最大タイル到達でコインを初回のみ付与。コイン100で「指定した数のブロックを全消去」ギミックを1回分購入可。</li>
+            <li>次スポーンは基本「直前に落とした列」。上段が埋まっていれば即終了。</li>
+            <li><strong>P で一時停止/再開</strong>。ポーズ中は入力・ギミックが無効になります。</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
